@@ -1,15 +1,10 @@
 # Ignore virtual environment
 venv/
+.idea
 
 # Byte-compiled Python files and cache
 __pycache__/
 *.pyc
-
-# Ignore weights, generated images, and test/training images from experiments
-experiments/*/weights.npz
-experiments/*/generated_*.png
-experiments/*/test_*.png
-experiments/*/train_*.png
 
 # Ignore entire datasets folder
 datasets/
