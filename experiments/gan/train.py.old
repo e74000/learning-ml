@@ -1,0 +1,242 @@
+import argparse
+import time
+from functools import partial
+from pathlib import Path
+
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+import numpy as np
+from models import gan
+from mlx.utils import tree_flatten
+from PIL import Image
+import os
+
+def load_anime_faces(directory, img_size=(64, 64)):
+    """
+    Load anime faces from a directory, resize to img_size, and normalize pixel values.
+    """
+    image_files = [os.path.join(directory, fname) for fname in os.listdir(directory)]
+    images = []
+    for img_file in image_files:
+        img = Image.open(img_file).convert("RGB")
+        img = np.array(img) / 255.0  # Normalize pixel values to [0, 1]
+        images.append(img)
+    images = np.stack(images)
+    return images
+
+def anime_faces_batch_iterator(images, batch_size):
+    """
+    Yield batches of anime faces.
+    """
+    num_samples = len(images)
+    indices = np.arange(num_samples)
+    np.random.shuffle(indices)
+    for start_idx in range(0, num_samples, batch_size):
+        end_idx = min(start_idx + batch_size, num_samples)
+        batch_indices = indices[start_idx:end_idx]
+        yield images[batch_indices]
+
+def grid_image_from_batch(image_batch, num_rows):
+    """
+    Generate a grid image from a batch of images.
+    Assumes input shape is (B, H, W, C).
+    """
+    B, H, W, C = image_batch.shape
+    num_cols = (B + num_rows - 1) // num_rows  # Ensure enough columns for all images
+
+    # Calculate grid image size
+    grid_height = num_rows * H
+    grid_width = num_cols * W
+
+    # Normalize and convert to uint8
+    image_batch = (image_batch * 255).astype(np.uint8)
+
+    # Create an empty array for the grid image
+    grid_image = np.zeros((grid_height, grid_width, C), dtype=np.uint8)
+
+    # Fill the grid with images
+    for idx, img in enumerate(image_batch):
+        row = idx // num_cols
+        col = idx % num_cols
+        grid_image[row * H:(row + 1) * H, col * W:(col + 1) * W, :] = img
+
+    return Image.fromarray(grid_image)
+
+def generate_and_save_images(generator, noise, epoch, save_dir, num_samples=64):
+    """
+    Generate images using the generator and save as a grid image.
+    """
+    fake_images = generator(noise)
+    fake_images = np.array(fake_images)
+    grid_image = grid_image_from_batch(fake_images, num_rows=8)
+    grid_image.save(save_dir / f'generated_{epoch:03d}.png')
+
+
+def discriminator_loss(dis, gen, real_data, noise):
+    # Discriminator on real data
+    real_output = dis(real_data)
+    real_labels = mx.full([real_output.shape[0]], 1.0)
+    loss_real = nn.losses.binary_cross_entropy(real_output, real_labels)
+
+    # Discriminator on fake data
+    fake_data = gen(noise)
+    fake_output = dis(fake_data)
+    fake_labels = mx.full([fake_output.shape[0]], 0.0)
+    loss_fake = nn.losses.binary_cross_entropy(fake_output, fake_labels)
+
+    # Total loss
+    total_loss = loss_real + loss_fake
+    return total_loss
+
+def generator_loss(dis, gen, noise):
+    fake_data = gen(noise)
+    fake_output = dis(fake_data)
+    labels = mx.full([fake_output.shape[0]], 1.0)  # Generator wants discriminator to predict 1
+    loss = nn.losses.binary_cross_entropy(fake_output, labels)
+    return loss
+
+
+def main(args):
+    nf = 64
+    nc = 3
+    nz = 128
+
+    train_images = load_anime_faces("datasets/anime_faces_cleaned", nc)
+    train_iter = anime_faces_batch_iterator(train_images, args.batch_size)
+
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    dis = gan.Discriminator(nf, nc)
+    mx.eval(dis)
+    gen = gan.Generator(nz, nf, nc)
+    mx.eval(gen)
+
+    n_params_d = sum(x.size for _, x in tree_flatten(dis.trainable_parameters()))
+    n_params_g = sum(x.size for _, x in tree_flatten(gen.trainable_parameters()))
+    print(f"Number of trainable discriminator params: {n_params_d/1e6:0.04f} M")
+    print(f"Number of trainable generator params:     {n_params_g/1e6:0.04f} M")
+
+    optimizer_d = optim.AdamW(learning_rate=args.lr)
+    optimizer_g = optim.AdamW(learning_rate=args.lr)
+
+    fixed_noise = mx.random.normal([64, 1, 1, nz])
+
+    state = [
+        dis.state, gen.state,
+        optimizer_d.state, optimizer_g.state
+    ]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(real_data, noise):
+        loss_d_fn = nn.value_and_grad(dis, discriminator_loss)
+        loss_d, grad_d = loss_d_fn(dis, gen, real_data, noise)
+        optimizer_d.update(dis, grad_d)
+
+        loss_g_fn = nn.value_and_grad(gen, generator_loss)
+        loss_g, grad_g = loss_g_fn(dis, gen, noise)
+        optimizer_g.update(gen, grad_g)
+
+        return loss_d, loss_g
+
+    for e in range(1, args.epochs + 1):
+        train_iter = anime_faces_batch_iterator(train_images, args.batch_size)
+
+        dis.train()
+        gen.train()
+
+        tic = time.perf_counter()
+        loss_acc_g = 0.0
+        loss_acc_d = 0.0
+        throughput_acc = 0.0
+
+        for batch_count, batch in enumerate(train_iter):
+            real_data = mx.array(batch)
+            noise = mx.random.normal([real_data.shape[0], 1, 1, nz])
+
+            throughput_tic = time.perf_counter()
+
+            loss_d, loss_g = step(real_data, noise)
+            gen.eval()
+            dis.eval()
+            mx.eval(state)
+
+            throughput_toc = time.perf_counter()
+            throughput_acc += real_data.shape[0] / (throughput_toc - throughput_tic)
+            loss_acc_d += loss_d.item()
+            loss_acc_g += loss_g.item()
+            if batch_count > 0 and (batch_count % 10 == 0):
+                print(
+                    " | ".join(
+                        [
+                            f"Epoch {e:4d}",
+                            f"Dis Loss {(loss_acc_d / batch_count):10.2f}",
+                            f"Gen Loss {(loss_acc_g / batch_count):10.2f}",
+                            f"Throughput {(throughput_acc / batch_count):8.2f} im/s",
+                            f"Batch {batch_count:5d}",
+                        ]
+                    ),
+                    end="\r",
+                )
+        toc = time.perf_counter()
+
+        print(
+            " | ".join(
+                [
+                    f"Epoch {e:4d}",
+                    f"Dis Loss {(loss_acc_d / batch_count):10.2f}",
+                    f"Gen Loss {(loss_acc_g / batch_count):10.2f}",
+                    f"Throughput {(throughput_acc / batch_count):8.2f} im/s",
+                    f"Time {toc - tic:8.1f} (s)",
+                ]
+            )
+        )
+
+        dis.eval()
+        gen.eval()
+
+        generate_and_save_images(gen, fixed_noise, e, save_dir)
+
+        dis.save_weights(str(save_dir / "weights_dis.npz"))
+        gen.save_weights(str(save_dir / "weights_gen.npz"))
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Use CPU instead of GPU acceleration",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--batch-size", type=int, default=128, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=100, help="Number of training epochs"
+    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default="experiments/gan/take_0/",
+        help="Path to save the model and generated images.",
+    )
+
+    args = parser.parse_args()
+
+    if args.cpu:
+        mx.set_default_device(mx.cpu)
+
+    np.random.seed(args.seed)
+    mx.random.seed(args.seed)
+
+    print("Options: ")
+    print(f"  Device: {'GPU' if not args.cpu else 'CPU'}")
+    print(f"  Seed: {args.seed}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Number of epochs: {args.epochs}")
+    print(f"  Learning rate: {args.lr}")
+
+    main(args)

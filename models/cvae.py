@@ -3,7 +3,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from conv_utils import UpsamplingConv2d
+from models.conv_utils import UpsamplingConv2d
 
 class Encoder(nn.Module):
     def __init__(self, n_latent, image_shape, max_n_filters):
